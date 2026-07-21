@@ -398,6 +398,163 @@ pub(crate) unsafe fn xcb_get_window_attributes(connection: *mut libc::c_void, wi
 	Some((map_state, override_redirect))
 }
 
+// ---------------------------------------------------------------------------
+// XCB get_property types (WM_CLASS)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct XcbGetPropertyCookie {
+	sequence: u32,
+}
+
+#[repr(C)]
+struct XcbGetPropertyReply {
+	response_type: u8,
+	pad0: u8,
+	sequence: u16,
+	length: u32,
+	type_: u32,
+	bytes_after: u32,
+	value_len: u32,
+	pad1: [u8; 4],
+	value: [u8; 0],
+}
+
+type FnXcbInternAtom = unsafe extern "C" fn(*mut libc::c_void, u8, u16, *const u8) -> XcbInternAtomCookie;
+type FnXcbInternAtomReply =
+	unsafe extern "C" fn(*mut libc::c_void, XcbInternAtomCookie, *mut *mut libc::c_void) -> *mut XcbInternAtomReply;
+type FnXcbGetProperty = unsafe extern "C" fn(
+	*mut libc::c_void,
+	u32,
+	u32,
+	u32,
+	u32,
+	u32,
+) -> XcbGetPropertyCookie;
+type FnXcbGetPropertyReply = unsafe extern "C" fn(
+	*mut libc::c_void,
+	XcbGetPropertyCookie,
+	*mut *mut libc::c_void,
+) -> *mut XcbGetPropertyReply;
+
+#[repr(C)]
+struct XcbInternAtomCookie {
+	sequence: u32,
+}
+
+#[repr(C)]
+struct XcbInternAtomReply {
+	response_type: u8,
+	pad0: u8,
+	sequence: u16,
+	length: u32,
+	atom: u32,
+}
+
+/// Cached WM_CLASS atom (interned once). Atom 0 means intern failed.
+static WM_CLASS_ATOM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Intern the WM_CLASS atom once and cache it. Returns the atom, or 0 on failure.
+unsafe fn intern_wm_class_atom(connection: *mut libc::c_void) -> u32 {
+	*WM_CLASS_ATOM.get_or_init(|| {
+		use std::sync::OnceLock;
+		static FNS: OnceLock<Option<(FnXcbInternAtom, FnXcbInternAtomReply)>> = OnceLock::new();
+		let fns = FNS.get_or_init(|| {
+			libc::dlerror();
+			let lib = libc::dlopen(c"libxcb.so.1".as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
+			if lib.is_null() {
+				return None;
+			}
+			libc::dlerror();
+			let intern = libc::dlsym(lib, c"xcb_intern_atom".as_ptr());
+			libc::dlerror();
+			let intern_reply = libc::dlsym(lib, c"xcb_intern_atom_reply".as_ptr());
+			if intern.is_null() || intern_reply.is_null() {
+				return None;
+			}
+			Some((std::mem::transmute(intern), std::mem::transmute(intern_reply)))
+		});
+		let (intern, intern_reply) = match fns {
+			Some(f) => *f,
+			None => return 0,
+		};
+		let name = b"WM_CLASS\0";
+		let cookie = intern(connection, 1, name.len() as u16, name.as_ptr());
+		let reply = intern_reply(connection, cookie, std::ptr::null_mut());
+		if reply.is_null() {
+			return 0;
+		}
+		let atom = (*reply).atom;
+		libc::free(reply as *mut libc::c_void);
+		atom
+	})
+}
+
+/// Read the WM_CLASS (res_class, res_name) of an X11 window.
+///
+/// WM_CLASS is a STRING of "res_name\0res_class\0". We return the res_class
+/// (second null-terminated field), lowercased for case-insensitive matching.
+/// Used to discriminate game windows from launcher windows: the Rockstar
+/// Launcher has class "Launcher.exe" / "Rockstar", while the game is
+/// "RDR2.exe" / "RDR2". Returns None if the property is missing/unreadable.
+pub(crate) unsafe fn xcb_get_wm_class(connection: *mut libc::c_void, window: u32) -> Option<String> {
+	use std::sync::OnceLock;
+	static FNS: OnceLock<Option<(FnXcbGetProperty, FnXcbGetPropertyReply)>> = OnceLock::new();
+	let fns = FNS.get_or_init(|| {
+		libc::dlerror();
+		let lib = libc::dlopen(c"libxcb.so.1".as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
+		if lib.is_null() {
+			return None;
+		}
+		libc::dlerror();
+		let get_prop = libc::dlsym(lib, c"xcb_get_property".as_ptr());
+		libc::dlerror();
+		let get_prop_reply = libc::dlsym(lib, c"xcb_get_property_reply".as_ptr());
+		if get_prop.is_null() || get_prop_reply.is_null() {
+			return None;
+		}
+		Some((std::mem::transmute(get_prop), std::mem::transmute(get_prop_reply)))
+	});
+	let (get_property, get_property_reply) = match *fns {
+		Some(f) => f,
+		None => return None,
+	};
+
+	let atom = intern_wm_class_atom(connection);
+	if atom == 0 {
+		return None;
+	}
+
+	// XCB_GET_PROPERTY: delete=0, offset=0, length=2048 (generous).
+	let cookie = get_property(connection, 0, window, atom, 0, 2048);
+	let reply = get_property_reply(connection, cookie, std::ptr::null_mut());
+	if reply.is_null() {
+		return None;
+	}
+
+	let value_len = (*reply).value_len as usize;
+	// The value follows the fixed reply header. xcbGetPropertyReply is followed
+	// by the data; access it via the flexible `value` array member.
+	let data_ptr = (*reply).value.as_ptr();
+	let bytes = std::slice::from_raw_parts(data_ptr, value_len);
+	let res = parse_wm_class(bytes);
+	libc::free(reply as *mut libc::c_void);
+	res
+}
+
+/// Parse WM_CLASS bytes ("res_name\0res_class\0") and return res_class,
+/// lowercased. Returns None if the structure is malformed.
+fn parse_wm_class(bytes: &[u8]) -> Option<String> {
+	let mut fields = bytes.split(|&b| b == 0);
+	let _res_name = fields.next()?;
+	let res_class = fields.next()?;
+	if res_class.is_empty() {
+		return None;
+	}
+	Some(String::from_utf8_lossy(res_class).to_lowercase())
+}
+
+
 /// Check if any child window of `window` is VIEWABLE and larger than 1×1.
 pub(crate) unsafe fn xcb_get_largest_obscuring_child(
 	connection: *mut libc::c_void,
@@ -491,5 +648,43 @@ mod tests {
 		assert_eq!(std::mem::size_of::<XcbGetWindowAttributesReply>(), 44);
 		assert_eq!(std::mem::offset_of!(XcbGetWindowAttributesReply, map_state), 26);
 		assert_eq!(std::mem::offset_of!(XcbGetWindowAttributesReply, override_redirect), 27);
+	}
+
+	#[test]
+	fn get_property_reply_layout_matches_xcb() {
+		// XcbGetPropertyReply: the flexible `value` array adds no size, so the
+		// struct is the fixed header only. Verify the fields we read.
+		assert_eq!(std::mem::size_of::<XcbGetPropertyReply>(), 24);
+		assert_eq!(std::mem::offset_of!(XcbGetPropertyReply, type_), 8);
+		assert_eq!(std::mem::offset_of!(XcbGetPropertyReply, bytes_after), 12);
+		assert_eq!(std::mem::offset_of!(XcbGetPropertyReply, value_len), 16);
+		assert_eq!(std::mem::offset_of!(XcbGetPropertyReply, value), 24);
+	}
+
+	#[test]
+	fn intern_atom_reply_layout_matches_xcb() {
+		assert_eq!(std::mem::size_of::<XcbInternAtomReply>(), 12);
+		assert_eq!(std::mem::offset_of!(XcbInternAtomReply, atom), 8);
+	}
+
+	#[test]
+	fn parse_wm_class_extracts_res_class_lowercased() {
+		// WM_CLASS = "RDR2\0RDR2.exe\0" → res_class = "rdr2.exe"
+		let bytes = b"RDR2\0RDR2.exe\0";
+		assert_eq!(parse_wm_class(bytes).as_deref(), Some("rdr2.exe"));
+	}
+
+	#[test]
+	fn parse_wm_class_handles_empty_res_name() {
+		let bytes = b"\0Launcher.exe\0";
+		assert_eq!(parse_wm_class(bytes).as_deref(), Some("launcher.exe"));
+	}
+
+	#[test]
+	fn parse_wm_class_rejects_malformed() {
+		// No second null → no res_class.
+		assert_eq!(parse_wm_class(b"RDR2"), None);
+		// Empty everything.
+		assert_eq!(parse_wm_class(b"\0\0"), None);
 	}
 }

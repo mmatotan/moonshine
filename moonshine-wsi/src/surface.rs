@@ -200,6 +200,31 @@ pub unsafe extern "C" fn destroy_surface(
 // Surface format/capabilities hooks
 // ---------------------------------------------------------------------------
 
+/// Check whether a WM_CLASS res_class (lowercased) belongs to a launcher or
+/// auxiliary process that must NOT be bypassed. Such processes create windows
+/// that race the XWM and break multi-window launchers; even their fullscreen
+/// transitions must fall back to XWayland. Only the actual game window should
+/// be bypassed for HDR.
+///
+/// Blocklist rather than allowlist: game classes vary per title and can't be
+/// enumerated, while launcher classes are a finite known set.
+fn is_launcher_class(class: &str) -> bool {
+	// Rockstar Games Launcher + helpers (RDR2, GTA V, etc.).
+	if class == "launcher.exe" || class == "rockstar" || class == "socialclubhelper.exe" {
+		return true;
+	}
+	// Steam: Big Picture UI, webhelper, etc. Not the game itself.
+	if class == "steam" || class == "steamwebhelper" || class == "steamtinkerlaunch" {
+		return true;
+	}
+	// Proton/wine auxiliary processes (wineserver, services.exe, etc.) — these
+	// never present game frames.
+	if class.ends_with("_loader.exe") || class == "services.exe" || class == "winedevice.exe" {
+		return true;
+	}
+	false
+}
+
 /// Minimum image count the layer enforces (default 3 for smooth pipelining).
 /// Can be overridden via `MOONSHINE_WSI_MIN_IMAGE_COUNT`.
 fn min_image_count() -> u32 {
@@ -664,6 +689,16 @@ unsafe fn try_xwayland_bypass(
 	// Rockstar Launcher, which creates splash/login/dialog windows in
 	// sequence). Returning FEATURE_NOT_PRESENT here makes the caller fall
 	// back to the ICD's plain XCB surface (XWayland Glamor, SDR).
+	//
+	// Two gates:
+	// 1. The window's toplevel must be fullscreen (covers the root within 2px).
+	//    This skips windowed launcher/UI windows (e.g. 1292x732 dialogs).
+	// 2. The window's WM_CLASS must NOT match a known launcher class. The
+	//    Rockstar Launcher reuses a window ID and resizes it fullscreen during
+	//    launch, so geometry alone can't distinguish launcher-fullscreen from
+	//    game-fullscreen. Launcher classes (Launcher.exe, SocialClubHelper,
+	//    steamwebhelper, etc.) are blocklisted so only the actual game window
+	//    is bypassed.
 	if !crate::xcb::xcb_is_fullscreen_window(xcb_connection, xcb_window) {
 		crate::log_debug!(
 			"try_xwayland_bypass: skipping non-fullscreen window={}",
@@ -671,6 +706,18 @@ unsafe fn try_xwayland_bypass(
 		);
 		return VK_ERROR_FEATURE_NOT_PRESENT;
 	}
+
+	if let Some(class) = crate::xcb::xcb_get_wm_class(xcb_connection, xcb_window) {
+		if is_launcher_class(&class) {
+			crate::log_debug!(
+				"try_xwayland_bypass: skipping launcher window={} class=\"{}\"",
+				xcb_window,
+				class
+			);
+			return VK_ERROR_FEATURE_NOT_PRESENT;
+		}
+	}
+
 
 	// Create a fresh wl_surface on the compositor.
 	let wl_surface = wl.compositor.create_surface(&wl.qh, ());
@@ -753,5 +800,29 @@ mod tests {
 	#[test]
 	fn layer_extensions_are_non_empty() {
 		assert!(!LAYER_EXTENSIONS.is_empty());
+	}
+
+	#[test]
+	fn launcher_class_blocklist_matches() {
+		// Rockstar launcher + helpers.
+		assert!(is_launcher_class("launcher.exe"));
+		assert!(is_launcher_class("rockstar"));
+		assert!(is_launcher_class("socialclubhelper.exe"));
+		// Steam auxiliary.
+		assert!(is_launcher_class("steam"));
+		assert!(is_launcher_class("steamwebhelper"));
+		// Proton/wine helpers.
+		assert!(is_launcher_class("steam_loader.exe"));
+		assert!(is_launcher_class("services.exe"));
+		assert!(is_launcher_class("winedevice.exe"));
+	}
+
+	#[test]
+	fn game_classes_are_not_blocklisted() {
+		// Actual game windows must NOT match the blocklist so they get bypassed.
+		assert!(!is_launcher_class("rdr2.exe"));
+		assert!(!is_launcher_class("hogwartslegacy.exe"));
+		assert!(!is_launcher_class("witcher3.exe"));
+		assert!(!is_launcher_class("cyberpunk2077.exe"));
 	}
 }
