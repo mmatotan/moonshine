@@ -658,6 +658,20 @@ unsafe fn try_xwayland_bypass(
 		return VK_ERROR_FEATURE_NOT_PRESENT;
 	}
 
+	// Only bypass fullscreen game windows. Windowed launcher/UI windows must
+	// use normal XWayland so the XWM can manage them; bypassing them races
+	// window creation/destruction and breaks multi-window launchers (e.g. the
+	// Rockstar Launcher, which creates splash/login/dialog windows in
+	// sequence). Returning FEATURE_NOT_PRESENT here makes the caller fall
+	// back to the ICD's plain XCB surface (XWayland Glamor, SDR).
+	if !crate::xcb::xcb_is_fullscreen_window(xcb_connection, xcb_window) {
+		crate::log_debug!(
+			"try_xwayland_bypass: skipping non-fullscreen window={}",
+			xcb_window
+		);
+		return VK_ERROR_FEATURE_NOT_PRESENT;
+	}
+
 	// Create a fresh wl_surface on the compositor.
 	let wl_surface = wl.compositor.create_surface(&wl.qh, ());
 	wl.connection.flush().ok();

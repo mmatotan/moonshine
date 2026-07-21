@@ -348,6 +348,34 @@ pub(crate) unsafe fn xcb_get_toplevel_window(connection: *mut libc::c_void, wind
 	}
 }
 
+/// Check whether `window` (resolved to its toplevel) is fullscreen, i.e. its
+/// geometry covers the root (screen) window within a 2px tolerance.
+///
+/// Used to gate the XWayland bypass: only fullscreen game windows are
+/// bypassed, so windowed launcher/UI windows (e.g. the Rockstar Launcher's
+/// dialogs) fall back to normal XWayland. Bypassing those races the XWM on
+/// window creation/destruction and breaks multi-window launchers.
+pub(crate) unsafe fn xcb_is_fullscreen_window(connection: *mut libc::c_void, window: u32) -> bool {
+	let toplevel = match xcb_get_toplevel_window(connection, window) {
+		Some(t) => t,
+		None => return false,
+	};
+	let (_, _, tw, th) = match xcb_get_window_rect(connection, toplevel) {
+		Some(r) => r,
+		None => return false,
+	};
+	let (root, _, _) = match xcb_query_tree_window(connection, toplevel) {
+		Some(t) => t,
+		None => return false,
+	};
+	let (_, _, rw, rh) = match xcb_get_window_rect(connection, root) {
+		Some(r) => r,
+		None => return false,
+	};
+	// Fullscreen if the toplevel covers the root within 2px tolerance.
+	(tw as i32 - rw as i32).abs() <= 2 && (th as i32 - rh as i32).abs() <= 2
+}
+
 /// Get the `map_state` and `override_redirect` flags for an X11 window.
 pub(crate) unsafe fn xcb_get_window_attributes(connection: *mut libc::c_void, window: u32) -> Option<(u8, bool)> {
 	let fns = load_xcb_query_tree_fns()?;
